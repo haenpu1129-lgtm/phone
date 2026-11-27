@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>원격 차량 (폰 전용)</title>
+<!--
+  ================================================================
+  폰 2대만으로 동작하는 원격 차량 페이지 (노트북·서버 없음)
+  ================================================================
+  - 파일 하나로 두 역할을 한다: 🚗 차량 폰 / 🎮 조종기 폰
+  - 폰끼리 직접 연결: WebRTC (Web Real-Time Communication, 웹 실시간 통신)
+  - 처음에 서로를 찾아 주는 '소개팅 주선자'는 PeerJS 무료 공용 서버가 맡는다.
+    → 그래서 내 서버(노트북)가 필요 없다. 대신 인터넷(핫스팟 데이터)은 필요하다.
+
+  나중에 Sphero와 합치기
+  - 아래 "🔌 차량 콘센트(Vehicle)" 부분에 Sphero 어댑터를 꽂으면 된다.
+  - 차량 폰이 Sphero 바로 옆에 있으니 차량 폰이 Sphero를 조종하는 구조가 자연스럽다.
+  ================================================================
+-->
+<script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<style>
+  * { box-sizing: border-box; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  html, body { margin: 0; height: 100%; background: #111; color: #eee; font-family: system-ui, sans-serif;
+               overscroll-behavior: none; }
+  button { font-size: 16px; padding: 12px; border-radius: 12px; border: 0; color: #fff; background: #333; }
+  .tag { background: rgba(0,0,0,.65); padding: 3px 8px; border-radius: 10px; font-size: 12px; }
+  .hidden { display: none !important; }
+
+  /* ── 시작 화면 ── */
+  #home { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
+          gap: 14px; padding: 24px; text-align: center; }
+  #home input { font-size: 28px; width: 160px; text-align: center; padding: 10px; border-radius: 12px;
+                border: 1px solid #555; background: #1c1c1c; color: #fff; letter-spacing: 6px;
+                -webkit-user-select: text; user-select: text; }
+  #home .big { font-size: 22px; padding: 18px; width: 260px; }
+  #home .car { background: #2a7; } #home .ctl { background: #26c; }
+  #homeErr { color: #f66; min-height: 20px; }
+
+  /* ── 차량 화면 ── */
+  #carView { position: fixed; inset: 0; background: #000; }
+  #carView video { width: 100%; height: 100%; object-fit: cover; }
+  #carHud { position: fixed; top: 8px; left: 8px; right: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+  #subtitle { position: fixed; bottom: 25vh; left: 0; right: 0; text-align: center; font-size: 22px;
+              text-shadow: 0 0 6px #000; padding: 0 16px; }
+  #files { position: fixed; bottom: 8px; left: 8px; right: 8px; display: flex; flex-direction: column; gap: 4px; }
+  #files a { background: rgba(0,0,0,.7); color: #6cf; padding: 6px 10px; border-radius: 8px; font-size: 14px; }
+  #driveDebug { position: fixed; top: 40px; right: 8px; font-size: 14px; }
+  .rec { background: #d00 !important; }
+
+  /* ── 조종기 화면 ── */
+  #ctlView { display: flex; flex-direction: column; height: 100%; touch-action: none; }
+  #videoBox { position: relative; background: #000; aspect-ratio: 16/9; width: 100%; flex-shrink: 0; }
+  #remoteVideo { width: 100%; height: 100%; object-fit: contain; }
+  #ctlHud { position: absolute; top: 6px; left: 6px; display: flex; gap: 4px; flex-wrap: wrap; }
+  #alert { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+           background: rgba(200,0,0,.45); font-size: 26px; font-weight: bold; }
+  #controls { flex: 1; display: flex; gap: 10px; padding: 10px; align-items: center; justify-content: space-between; }
+  #joy { position: relative; width: 170px; height: 170px; border-radius: 50%; background: #222;
+         border: 2px solid #444; touch-action: none; flex-shrink: 0; }
+  #knob { position: absolute; width: 70px; height: 70px; border-radius: 50%; background: #4a8;
+          left: 50%; top: 50%; transform: translate(-50%, -50%); pointer-events: none; }
+  #side { display: flex; flex-direction: column; gap: 8px; flex: 1; max-width: 190px; }
+  #stopBtn { background: #c22; font-weight: bold; }
+  #talkBtn { background: #26c; padding: 20px 12px; touch-action: none; }
+  #talkBtn.on { background: #f80; }
+  #side label { font-size: 13px; color: #aaa; }
+  /* 차량이 조종 기능을 안 알려 주면(폰 기능만) 조이스틱 숨김 → 합치면 자동으로 나타남 */
+  body:not(.can-drive) .drive-only { display: none !important; }
+  body:not(.can-drive) #side { max-width: none; }
+  #chat { padding: 8px 10px 14px; border-top: 1px solid #333; }
+  #quick { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 6px; }
+  #quick button { font-size: 13px; padding: 6px 10px; white-space: nowrap; background: #2a2a2a; }
+  #chatRow { display: flex; gap: 6px; }
+  #chatInput { flex: 1; font-size: 16px; padding: 10px; border-radius: 10px; border: 1px solid #444;
+               background: #1c1c1c; color: #eee; -webkit-user-select: text; user-select: text; }
+  #log { font-size: 12px; color: #888; height: 34px; overflow-y: auto; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<!-- ───────── 시작 화면 ───────── -->
+<div id="home">
+  <h2>🚗 원격 차량</h2>
+  <p>두 폰에 <b>같은 방 번호</b>를 넣으세요</p>
+  <input id="room" inputmode="numeric" maxlength="6" placeholder="1234">
+  <button class="big car" id="asCar">🚗 차량 폰으로 시작</button>
+  <button class="big ctl" id="asCtl">🎮 조종기 폰으로 시작</button>
+  <div id="homeErr"></div>
+  <small style="color:#777">차량 폰을 먼저 시작하세요</small>
+</div>
+
+<!-- ───────── 차량 화면 ───────── -->
+<div id="carView" class="hidden">
+  <video id="preview" autoplay playsinline muted></video>
+  <audio id="remoteAudio" autoplay playsinline></audio>
+  <div id="carHud">
+    <span class="tag" id="carConn">연결 준비 중…</span>
+    <span class="tag" id="carPeer">조종기 대기</span>
+    <span class="tag hidden" id="carRec">● REC</span>
+    <span class="tag hidden" id="carTalk">🎙 수신 중</span>
+  </div>
+  <div id="driveDebug" class="tag hidden"></div>
+  <div id="subtitle"></div>
+  <div id="files"></div>
+</div>
+
+<!-- ───────── 조종기 화면 ───────── -->
+<div id="ctlView" class="hidden">
+  <div id="videoBox">
+    <video id="remoteVideo" autoplay playsinline muted></video>
+    <div id="ctlHud">
+      <span class="tag" id="ctlConn">연결 중…</span>
+      <span class="tag" id="vehTag">차량 -</span>
+      <span class="tag hidden" id="ctlRec">● REC</span>
+    </div>
+    <div id="alert">💥 충돌! 조이스틱에서 손을 떼세요</div>
+  </div>
+  <div id="controls">
+    <div id="joy" class="drive-only"><div id="knob"></div></div>
+    <div id="side">
+      <button id="stopBtn" class="drive-only">■ 긴급 정지</button>
+      <button id="recBtn">● 녹화 시작</button>
+      <button id="talkBtn">🎙 누르고 말하기</button>
+      <label class="drive-only">최대 속도 <span id="spdVal">100</span></label>
+      <input id="spd" class="drive-only" type="range" min="20" max="150" value="100">
+    </div>
+  </div>
+  <div id="chat">
+    <div id="quick">
+      <button>안녕하세요</button><button>비켜 주세요</button>
+      <button>지나가겠습니다</button><button>감사합니다</button><button>도착했습니다</button>
+    </div>
+    <div id="chatRow">
+      <input id="chatInput" placeholder="차량이 읽어 줄 문장" enterkeyhint="send">
+      <button id="sendBtn">전송</button>
+    </div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+// =====================================================================
+// 공통 도우미
+// =====================================================================
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+// 방 번호로 차량 폰의 고유 이름을 만든다. 조종기는 이 이름으로 차량을 찾아간다.
+// 앞에 긴 접두어를 붙이는 이유 → 공용 서버라 다른 사람의 '1234'와 겹치지 않게 하려고.
+const PREFIX = 'ajou-sphero-car-v1-';
+
+let room = '';
+try { room = localStorage.getItem('room') || ''; } catch (e) {}
+$('room').value = params.get('room') || room;
+
+function getRoom() {
+  const r = $('room').value.trim();
+  if (!/^\d{3,6}$/.test(r)) { $('homeErr').textContent = '방 번호는 숫자 3~6자리로 넣어 주세요'; return null; }
+  try { localStorage.setItem('room', r); } catch (e) {}
+  return r;
+}
+
+$('asCar').onclick = () => { const r = getRoom(); if (r) startCar(r); };
+$('asCtl').onclick = () => { const r = getRoom(); if (r) startController(r); };
+
+// =====================================================================
+// 🔌 차량 콘센트 (Vehicle 인터페이스)
+// ---------------------------------------------------------------------
+// 차량 폰은 "차량이라면 이 기능은 있다"는 약속만 알고 부른다.
+//   canDrive        : true면 조종기에 조이스틱이 나타남
+//   start(emit)     : 연결. 충돌 같은 사건은 emit({event:'collision'})으로 알림
+//   drive(h, s)     : 방향(0=앞, 90=오른쪽, 180=뒤, 270=왼쪽), 속도
+//   stop()          : 정지
+//   info()          : 조종기에 보여 줄 이름
+// 나중에 Sphero 어댑터를 만들어 createVehicle()에서 돌려주기만 하면 합쳐진다.
+// =====================================================================
+class NoVehicle {            // 지금: 차량 없음 (폰 기능만)
+  canDrive = false;
+  async start(emit) {}
+  drive(h, s) {}
+  stop() {}
+  info() { return { name: '차량 없음 (폰 기능만)' }; }
+}
+
+class PrintVehicle {         // 테스트: 받은 명령을 차량 폰 화면에 표시만 함
+  canDrive = true;
+  async start(emit) {
+    this.emit = emit;
+    $('driveDebug').classList.remove('hidden');
+    this.show(0, 0);
+  }
+  drive(h, s) { this.show(h, s); }
+  stop() { this.show(this.h || 0, 0); }
+  show(h, s) { this.h = h; $('driveDebug').textContent = `🧪 방향 ${h}° / 속도 ${s}`; }
+  info() { return { name: '가짜 차량 (테스트)' }; }
+  // 충돌 테스트: 차량 화면의 표시를 누르면 가짜 충돌 발생
+  enableFakeCollision() { $('driveDebug').onclick = () => this.emit({ event: 'collision' }); }
+}
+
+function createVehicle() {
+  // 주소 끝에 ?vehicle=print 를 붙이면 테스트용 가짜 차량
+  if (params.get('vehicle') === 'print') { const v = new PrintVehicle(); setTimeout(() => v.enableFakeCollision(), 0); return v; }
+  // 나중에: if (params.get('vehicle') === 'sphero') return new SpheroVehicle();
+  return new NoVehicle();
+}
+
+// =====================================================================
+// 🚗 차량 폰
+// =====================================================================
+let camStream, carPeer, ctlConn, ctlCall, recorder, chunks = [], wakeLock;
+let vehicle, lastDrive = 0, collisionLock = false;
+
+async function startCar(r) {
+  try {
+    // 후면 카메라 + 마이크(녹화에 주변 소리 담기)
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: { echoCancellation: true, noiseSuppression: true }
+    });
+  } catch (e) {
+    $('homeErr').textContent = '카메라/마이크 권한 오류: ' + e.message; return;
+  }
+  $('home').classList.add('hidden');
+  $('carView').classList.remove('hidden');
+  $('preview').srcObject = camStream;
+
+  // 시작 버튼을 누른 '지금' 소리를 한 번 내야 이후 자동 TTS·음성 재생이 허락된다
+  speak('차량 준비 완료');
+  $('remoteAudio').play().catch(() => {});
+  keepScreenOn();
+
+  vehicle = createVehicle();
+  await vehicle.start(onVehicleEvent);
+  setInterval(deadmanCheck, 200);
+  openCarPeer(r);
+}
+
+function openCarPeer(r) {
+  // Peer(피어, '동등한 상대'): 서버-손님 관계가 아니라 대등하게 직접 연결되는 상대
+  carPeer = new Peer(PREFIX + r);
+  carPeer.on('open', () => ($('carConn').textContent = `✅ 방 ${r}`));
+  carPeer.on('error', (err) => {
+    // 새로고침 직후엔 예전 이름이 아직 서버에 남아 있어 'unavailable-id'가 날 수 있다 → 잠시 후 재시도
+    $('carConn').textContent = '⚠ ' + err.type;
+    if (err.type === 'unavailable-id' || err.type === 'network' || err.type === 'server-error') {
+      carPeer.destroy(); setTimeout(() => openCarPeer(r), 3000);
+    }
+  });
+  carPeer.on('disconnected', () => { if (!carPeer.destroyed) carPeer.reconnect(); });
+
+  // 조종기가 '메시지 통로'를 열어 옴
+  carPeer.on('connection', (conn) => {
+    if (ctlConn) ctlConn.close();      // 조종기는 한 대만
+    ctlConn = conn;
+    conn.on('open', () => {
+      $('carPeer').textContent = '🎮 조종기 연결';
+      sendHello();
+    });
+    conn.on('data', (d) => handleCarMessage(typeof d === 'string' ? JSON.parse(d) : d));
+    conn.on('close', () => {
+      if (ctlConn === conn) { ctlConn = null; $('carPeer').textContent = '조종기 대기'; vehicle.stop(); }
+    });
+  });
+
+  // 조종기가 '영상 통화'를 걸어 옴 → 내 카메라 영상으로 받기
+  carPeer.on('call', (call) => {
+    if (ctlCall) ctlCall.close();
+    ctlCall = call;
+    // 영상만 보낸다. 차량 마이크까지 보내면 조종기 스피커↔마이크 메아리(에코)가 생기기 쉽다.
+    call.answer(new MediaStream(camStream.getVideoTracks()));
+    call.on('stream', (remote) => {
+      // 조종기 목소리(말하기 버튼)를 스피커로
+      $('remoteAudio').srcObject = new MediaStream(remote.getAudioTracks());
+      $('remoteAudio').play().catch(() => {});
+    });
+  });
+}
+
+// 차량 정보(조종 가능 여부 등)를 조종기에 알림
+function sendHello() {
+  carSend({ type: 'hello', features: { drive: vehicle.canDrive }, vehicle: vehicle.info() });
+  sendRecStatus();
+}
+
+function carSend(obj) { if (ctlConn && ctlConn.open) ctlConn.send(JSON.stringify(obj)); }
+
+function handleCarMessage(msg) {
+  switch (msg.type) {
+    case 'hello-request': sendHello(); break;   // 조종기가 정보를 다시 요청
+    case 'say': speak(msg.text); break;
+    case 'record': msg.action === 'start' ? startRecording() : stopRecording(); break;
+    case 'talk': $('carTalk').classList.toggle('hidden', !msg.on); break;
+    case 'drive': {
+      lastDrive = Date.now();
+      let speed = Math.max(0, Math.min(150, msg.speed | 0));
+      if (speed === 0) collisionLock = false;   // 손을 뗐다 = 충돌을 인지했다 → 잠금 해제
+      if (collisionLock) speed = 0;              // 충돌 후 손 떼기 전엔 출발 금지
+      vehicle.drive(((msg.heading | 0) % 360 + 360) % 360, speed);
+      break;
+    }
+    case 'stop': vehicle.stop(); break;
+  }
+}
+
+// 데드맨 스위치(Dead-man's switch): 기관사가 쓰러지면 열차가 서는 장치에서 온 말.
+// 조종 신호가 0.7초 끊기면(인터넷 끊김, 앱 멈춤) 차가 혼자 달리지 않게 세운다.
+let deadmanFired = true;
+function deadmanCheck() {
+  if (Date.now() - lastDrive > 700) { if (!deadmanFired) { vehicle.stop(); deadmanFired = true; } }
+  else deadmanFired = false;
+}
+
+function onVehicleEvent(ev) {
+  if (ev.event === 'collision') {
+    collisionLock = true;
+    vehicle.stop();
+    speak('충돌했습니다. 정지합니다.');
+  }
+  carSend({ type: 'vehicle-event', ...ev });
+}
+
+// ── 녹화 (차량 폰에 저장) ──
+function pickMime() {
+  const list = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+  return list.find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+}
+function startRecording() {
+  if (recorder && recorder.state === 'recording') return;
+  chunks = [];
+  const mimeType = pickMime();
+  recorder = new MediaRecorder(camStream, mimeType ? { mimeType, videoBitsPerSecond: 2_500_000 } : {});
+  recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = saveRecording;
+  recorder.start(1000);   // 1초마다 조각 저장 → 중간에 문제가 생겨도 앞부분은 남음
+  $('carRec').classList.remove('hidden'); $('carRec').classList.add('rec');
+  sendRecStatus();
+}
+function stopRecording() { if (recorder && recorder.state === 'recording') recorder.stop(); }
+function saveRecording() {
+  const type = recorder.mimeType || 'video/webm';
+  const ext = type.includes('mp4') ? 'mp4' : 'webm';
+  const url = URL.createObjectURL(new Blob(chunks, { type }));
+  const name = `car_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.${ext}`;
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click();   // 자동 다운로드
+  const link = document.createElement('a'); link.href = url; link.download = name;    // 막힐 때 대비 링크
+  link.textContent = `💾 ${name} 저장`; $('files').prepend(link);
+  $('carRec').classList.add('hidden');
+  sendRecStatus();
+}
+function sendRecStatus() { carSend({ type: 'record-status', recording: !!(recorder && recorder.state === 'recording') }); }
+
+// ── TTS ──
+function speak(text) {
+  if (!text) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);   // Utterance(어터런스) = '말한 한 마디'
+  u.lang = 'ko-KR';
+  const ko = speechSynthesis.getVoices().find((v) => v.lang.startsWith('ko'));
+  if (ko) u.voice = ko;
+  speechSynthesis.speak(u);
+  $('subtitle').textContent = '💬 ' + text;
+  clearTimeout(speak._t); speak._t = setTimeout(() => ($('subtitle').textContent = ''), 4000);
+}
+speechSynthesis.getVoices();
+
+// ── 화면 꺼짐 방지 ──
+async function keepScreenOn() { try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (e) {} }
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && camStream) keepScreenOn();
+});
+
+// =====================================================================
+// 🎮 조종기 폰
+// =====================================================================
+let ctlPeer, carConn, carCall, micStream, sendStream, recording = false, retryTimer;
+
+async function startController(r) {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch (e) {
+    micStream = null;  // 마이크 없어도 영상·채팅은 동작
+  }
+  // 왜 가짜(검은) 영상 트랙을 같이 보내나?
+  // → WebRTC는 '전화 거는 쪽'의 제안서에 영상 칸이 있어야 상대가 영상을 보내 줄 수 있다.
+  //   조종기는 카메라를 안 쓰니, 1x1 크기의 빈 캔버스 영상으로 칸만 만들어 둔다.
+  const canvas = Object.assign(document.createElement('canvas'), { width: 2, height: 2 });
+  canvas.getContext('2d').fillRect(0, 0, 2, 2);
+  const dummyVideo = canvas.captureStream(1).getVideoTracks()[0];
+  const audioTracks = micStream ? micStream.getAudioTracks() : [];
+  audioTracks.forEach((t) => (t.enabled = false));   // 평소엔 음소거, 말하기 버튼 누를 때만 켬
+  sendStream = new MediaStream([...audioTracks, dummyVideo]);
+
+  $('home').classList.add('hidden');
+  $('ctlView').classList.remove('hidden');
+  $('remoteVideo').play().catch(() => {});
+
+  ctlPeer = new Peer();   // 조종기 이름은 아무거나(자동)
+  ctlPeer.on('open', () => connectToCar(r));
+  ctlPeer.on('disconnected', () => { if (!ctlPeer.destroyed) ctlPeer.reconnect(); });
+  ctlPeer.on('error', (err) => {
+    // 'peer-unavailable' = 그 방 번호의 차량 폰이 아직 없음 → 3초마다 다시 찾기
+    $('ctlConn').textContent = err.type === 'peer-unavailable' ? `🔍 방 ${r} 차량 찾는 중…` : '⚠ ' + err.type;
+    scheduleRetry(r);
+  });
+}
+
+function scheduleRetry(r) {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => connectToCar(r), 3000);
+}
+
+function connectToCar(r) {
+  if (carConn) carConn.close();
+  if (carCall) carCall.close();
+  const target = PREFIX + r;
+  $('ctlConn').textContent = `🔗 방 ${r} 연결 중…`;
+
+  // 1) 메시지 통로(DataConnection): 채팅·녹화·조종 명령
+  const conn = ctlPeer.connect(target, { reliable: true });
+  carConn = conn;
+  conn.on('open', () => {
+    $('ctlConn').textContent = `✅ 방 ${r}`;
+    // 왜 다시 요청하나? → 연결 직후 양쪽 통로가 열리는 순간이 미세하게 달라서
+    // 차량이 먼저 보낸 hello가 유실될 수 있다. 내가 준비된 뒤 한 번 더 요청하면 확실하다.
+    conn.send(JSON.stringify({ type: 'hello-request' }));
+    // 2) 영상 통화(MediaConnection): 차량 영상 받기 + 내 목소리 보내기
+    carCall = ctlPeer.call(target, sendStream);
+    carCall.on('stream', (remote) => {
+      $('remoteVideo').srcObject = new MediaStream(remote.getVideoTracks());
+      $('remoteVideo').play().catch(() => {});
+    });
+  });
+  conn.on('data', (d) => handleCtlMessage(typeof d === 'string' ? JSON.parse(d) : d));
+  conn.on('close', () => {
+    // 내가 새 연결로 갈아타면서 닫은 '옛 연결'이면 무시 (안 그러면 재연결이 무한 반복됨)
+    if (conn !== carConn) return;
+    $('ctlConn').textContent = '❌ 차량 끊김, 재연결 중…';
+    document.body.classList.remove('can-drive');
+    scheduleRetry(r);
+  });
+}
+
+function ctlSend(obj) { if (carConn && carConn.open) carConn.send(JSON.stringify(obj)); }
+const log = (t) => { const d = document.createElement('div'); d.textContent = t; $('log').prepend(d); };
+
+function handleCtlMessage(msg) {
+  switch (msg.type) {
+    case 'hello':
+      // 차량이 알려 준 기능대로 화면 구성 (drive가 true면 조이스틱 표시)
+      document.body.classList.toggle('can-drive', !!msg.features?.drive);
+      $('vehTag').textContent = msg.vehicle?.name || '차량';
+      break;
+    case 'record-status': setRecording(msg.recording); break;
+    case 'vehicle-event': if (msg.event === 'collision') showCollision(); break;
+  }
+}
+
+// ── 조이스틱 ──
+const joy = $('joy'), knob = $('knob');
+let joyActive = false, joyHeading = 0, joySpeed = 0, sendTimer = null;
+function joyMove(e) {
+  const rect = joy.getBoundingClientRect(), radius = rect.width / 2;
+  let dx = e.clientX - (rect.left + radius), dy = e.clientY - (rect.top + radius);
+  const dist = Math.min(Math.hypot(dx, dy), radius), ang = Math.atan2(dy, dx);
+  dx = Math.cos(ang) * dist; dy = Math.sin(ang) * dist;
+  knob.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+  // 화면은 아래가 +y → -dy로 뒤집어 '위 = 앞(0도)', 시계 방향으로 각도 증가
+  joyHeading = Math.round((Math.atan2(dx, -dy) * 180 / Math.PI + 360) % 360);
+  const ratio = dist / radius;
+  joySpeed = ratio < 0.2 ? 0 : Math.round(ratio * Number($('spd').value)); // 가운데 20%는 데드존
+}
+joy.addEventListener('pointerdown', (e) => {
+  joyActive = true; joy.setPointerCapture(e.pointerId); joyMove(e);
+  // 0.1초마다 계속 보냄: 차량 폰의 데드맨 스위치에 "아직 조종 중"이라고 알리기 위해
+  sendTimer = setInterval(() => ctlSend({ type: 'drive', heading: joyHeading, speed: joySpeed }), 100);
+});
+joy.addEventListener('pointermove', (e) => { if (joyActive) joyMove(e); });
+const joyEnd = () => {
+  if (!joyActive) return;
+  joyActive = false; clearInterval(sendTimer);
+  knob.style.transform = 'translate(-50%, -50%)';
+  ctlSend({ type: 'drive', heading: joyHeading, speed: 0 });
+};
+joy.addEventListener('pointerup', joyEnd);
+joy.addEventListener('pointercancel', joyEnd);
+$('spd').oninput = () => ($('spdVal').textContent = $('spd').value);
+$('stopBtn').onclick = () => ctlSend({ type: 'stop' });
+
+// ── 충돌 알림 ──
+function showCollision() {
+  $('alert').style.display = 'flex';
+  navigator.vibrate?.([200, 100, 200]);
+  log('💥 충돌 감지 → 자동 정지');
+  setTimeout(() => ($('alert').style.display = 'none'), 2000);
+}
+
+// ── 녹화 원격 제어 ──
+$('recBtn').onclick = () => ctlSend({ type: 'record', action: recording ? 'stop' : 'start' });
+function setRecording(on) {
+  if (on === recording) return;
+  recording = on;
+  $('recBtn').textContent = on ? '■ 녹화 중지' : '● 녹화 시작';
+  $('recBtn').classList.toggle('rec', on);
+  $('ctlRec').classList.toggle('hidden', !on);
+  $('ctlRec').classList.toggle('rec', on);
+  log(on ? '● 녹화 시작' : '■ 녹화 저장됨 (차량 폰)');
+}
+
+// ── 채팅 → 차량 TTS ──
+function sendSay(text) { text = text.trim(); if (!text) return; ctlSend({ type: 'say', text }); log('💬 ' + text); }
+$('sendBtn').onclick = () => { sendSay($('chatInput').value); $('chatInput').value = ''; };
+$('chatInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); $('sendBtn').click(); } // 한글 조합 중 엔터 중복 방지
+});
+document.querySelectorAll('#quick button').forEach((b) => (b.onclick = () => sendSay(b.textContent)));
+
+// ── 누르고 말하기 (PTT: Push-To-Talk, 무전기 방식) ──
+const talkBtn = $('talkBtn');
+function talk(on) {
+  if (!micStream) { if (on) log('⚠ 마이크 권한이 없어 말하기를 쓸 수 없어요'); return; }
+  micStream.getAudioTracks().forEach((t) => (t.enabled = on));
+  talkBtn.classList.toggle('on', on);
+  talkBtn.textContent = on ? '🔴 말하는 중…' : '🎙 누르고 말하기';
+  ctlSend({ type: 'talk', on });
+}
+talkBtn.addEventListener('pointerdown', (e) => { talkBtn.setPointerCapture(e.pointerId); talk(true); });
+talkBtn.addEventListener('pointerup', () => talk(false));
+talkBtn.addEventListener('pointercancel', () => talk(false));
+document.addEventListener('contextmenu', (e) => e.preventDefault());
+</script>
+</body>
+</html>
